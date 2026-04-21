@@ -108,6 +108,7 @@ from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.redis_pool import get_redis_replica_client
 from onyx.redis.redis_pool import redis_lock_dump
 from onyx.redis.redis_pool import SCAN_ITER_COUNT_DEFAULT
+from onyx.redis.redis_tenant_work_gating import maybe_mark_tenant_active
 from onyx.redis.redis_utils import is_fence
 from onyx.server.metrics.connector_health_metrics import on_connector_error_state_change
 from onyx.server.metrics.connector_health_metrics import on_connector_indexing_success
@@ -810,7 +811,7 @@ def check_for_indexing(self: Task, *, tenant_id: str) -> int | None:
 
     # we need to use celery's redis client to access its redis data
     # (which lives on a different db number)
-    # redis_client_celery: Redis = self.app.broker_connection().channel().client  # type: ignore
+    # redis_client_celery: Redis = self.app.broker_connection().channel().client
 
     lock_beat: RedisLock = redis_client.lock(
         OnyxRedisLocks.CHECK_INDEXING_BEAT_LOCK,
@@ -1012,6 +1013,14 @@ def check_for_indexing(self: Task, *, tenant_id: str) -> int | None:
                 task_logger.info(
                     f"Skipping secondary indexing: switchover_type=INSTANT for search_settings={secondary_search_settings.id}"
                 )
+
+        # Tenant-work-gating hook: refresh membership only when indexing
+        # actually dispatched at least one docfetching task. `_kickoff_indexing_tasks`
+        # internally calls `should_index()` to decide per-cc_pair; using
+        # `tasks_created > 0` here gives us a "real work was done" signal
+        # rather than just "tenant has a cc_pair somewhere."
+        if tasks_created > 0:
+            maybe_mark_tenant_active(tenant_id, caller="check_for_indexing")
 
         # 2/3: VALIDATE
         # Check for inconsistent index attempts - active attempts without task IDs

@@ -181,8 +181,10 @@ class EncryptedString(_EncryptedBase):
             # Handle both raw strings and SensitiveValue wrappers
             if isinstance(value, SensitiveValue):
                 # Get raw value for storage
-                value = value.get_value(apply_mask=False)
-            return encrypt_string_to_bytes(value)
+                value = value.get_value(  # ty: ignore[invalid-assignment]
+                    apply_mask=False
+                )
+            return encrypt_string_to_bytes(value)  # ty: ignore[invalid-argument-type]
         return value
 
     def process_result_value(
@@ -210,7 +212,9 @@ class EncryptedJson(_EncryptedBase):
     ) -> bytes | None:
         if value is not None:
             if isinstance(value, SensitiveValue):
-                value = value.get_value(apply_mask=False)
+                value = value.get_value(  # ty: ignore[invalid-assignment]
+                    apply_mask=False
+                )
             json_str = json.dumps(value)
             return encrypt_string_to_bytes(json_str)
         return value
@@ -294,8 +298,8 @@ Auth/Authz (users, permissions, access) Tables
 
 class OAuthAccount(SQLAlchemyBaseOAuthAccountTableUUID, Base):
     # even an almost empty token from keycloak will not fit the default 1024 bytes
-    access_token: Mapped[str] = mapped_column(Text, nullable=False)  # type: ignore
-    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)  # type: ignore
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class User(SQLAlchemyBaseUserTableUUID, Base):
@@ -890,7 +894,7 @@ class HierarchyNode(Base):
     # For hierarchy nodes that are also documents (e.g., Confluence pages)
     # SET NULL when document is deleted - node can exist without its document
     document_id: Mapped[str | None] = mapped_column(
-        ForeignKey("document.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("document.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
     # Self-referential FK for tree structure
@@ -948,6 +952,7 @@ class Document(Base):
     semantic_id: Mapped[str] = mapped_column(NullFilteredString)
     # First Section's link
     link: Mapped[str | None] = mapped_column(NullFilteredString, nullable=True)
+    file_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # The updated time is also used as a measure of the last successful state of the doc
     # pulled from the source (to help skip reindexing already updated docs in case of
@@ -1050,9 +1055,9 @@ class Document(Base):
 
     __table_args__ = (
         Index(
-            "ix_document_sync_status",
-            last_modified,
-            last_synced,
+            "ix_document_needs_sync",
+            "id",
+            postgresql_where=text("last_modified > last_synced OR last_synced IS NULL"),
         ),
     )
 
@@ -2199,6 +2204,7 @@ class IndexAttempt(Base):
     connector_credential_pair_id: Mapped[int] = mapped_column(
         ForeignKey("connector_credential_pair.id"),
         nullable=False,
+        index=True,
     )
 
     # Some index attempts that run from beginning will still have this as False
@@ -2402,10 +2408,12 @@ class IndexAttemptError(Base):
     index_attempt_id: Mapped[int] = mapped_column(
         ForeignKey("index_attempt.id"),
         nullable=False,
+        index=True,
     )
     connector_credential_pair_id: Mapped[int] = mapped_column(
         ForeignKey("connector_credential_pair.id"),
         nullable=False,
+        index=True,
     )
 
     document_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -4504,7 +4512,7 @@ class UserFile(Base):
     file_id: Mapped[str] = mapped_column(nullable=False)
     name: Mapped[str] = mapped_column(nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
-        default=datetime.datetime.utcnow
+        default=lambda: datetime.datetime.now(datetime.timezone.utc)
     )
     user: Mapped["User"] = relationship(back_populates="files")
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
