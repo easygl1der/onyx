@@ -248,10 +248,10 @@ function FormContent({
           <Hoverable.Root group="definitionField" width="full">
             <div className="relative w-full">
               {values.definition.trim() && (
-                <div className="absolute z-[100000] top-2 right-2 bg-background-tint-00">
+                <div className="absolute z-100000 top-2 right-2 bg-background-tint-00">
                   <Hoverable.Item
                     group="definitionField"
-                    variant="opacity-on-hover"
+                    variant="appear-on-hover"
                   >
                     <div className="flex">
                       <CopyIconButton

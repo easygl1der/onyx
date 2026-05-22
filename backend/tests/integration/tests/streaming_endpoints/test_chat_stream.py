@@ -36,9 +36,9 @@ def test_send_two_messages(basic_user: DATestUser) -> None:
         chat_session=test_chat_session,
         user_performing_action=basic_user,
     )
-    assert (
-        len(chat_history) == 3
-    ), "Chat session should have 1 system message, 1 user message, and 1 assistant message"
+    assert len(chat_history) == 3, (
+        "Chat session should have 1 system message, 1 user message, and 1 assistant message"
+    )
 
     response2 = ChatSessionManager.send_message(
         chat_session_id=test_chat_session.id,
@@ -55,13 +55,12 @@ def test_send_two_messages(basic_user: DATestUser) -> None:
         chat_session=test_chat_session,
         user_performing_action=basic_user,
     )
-    assert (
-        len(chat_history2) == 5
-    ), "Chat session should have 1 system message, 2 user messages, and 2 assistant messages"
+    assert len(chat_history2) == 5, (
+        "Chat session should have 1 system message, 2 user messages, and 2 assistant messages"
+    )
 
 
 def test_send_message_simple_with_history(
-    reset: None,  # noqa: ARG001
     admin_user: DATestUser,
 ) -> None:
     LLMProviderManager.create(user_performing_action=admin_user)
@@ -121,7 +120,6 @@ def test_send_message__basic_searches(
 
 
 def test_send_message_disconnect_and_cleanup(
-    reset: None,  # noqa: ARG001
     admin_user: DATestUser,
 ) -> None:
     """
@@ -171,6 +169,6 @@ def test_send_message_disconnect_and_cleanup(
         if msg != TERMINATED_RESPONSE_MESSAGE and msg != LOADING_RESPONSE_MESSAGE:
             break
 
-    assert (
-        msg != TERMINATED_RESPONSE_MESSAGE and msg != LOADING_RESPONSE_MESSAGE
-    ), f"Assistant message should no longer be the terminated response message after cleanup, got: {msg}"
+    assert msg != TERMINATED_RESPONSE_MESSAGE and msg != LOADING_RESPONSE_MESSAGE, (
+        f"Assistant message should no longer be the terminated response message after cleanup, got: {msg}"
+    )

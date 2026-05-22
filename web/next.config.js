@@ -19,7 +19,10 @@ const cspHeader = `
 const nextConfig = {
   productionBrowserSourceMaps: false,
   output: "standalone",
-  transpilePackages: ["@onyx/opal"],
+  // Hosts allowed to load Next.js dev resources (e.g. HMR) cross-origin.
+  // Needed when accessing the local dev server through a tunnel like ngrok.
+  allowedDevOrigins: ["cataract-brunette-icon.ngrok-free.dev"],
+  transpilePackages: ["@onyx-ai/opal"],
   typedRoutes: true,
   reactCompiler: true,
   images: {
@@ -35,7 +38,6 @@ const nextConfig = {
     unoptimized: true, // Disable image optimization to avoid requiring Sharp
   },
   async headers() {
-    const isDev = process.env.NODE_ENV === "development";
     return [
       {
         source: "/(.*)",
@@ -60,18 +62,6 @@ const nextConfig = {
             key: "Permissions-Policy",
             value:
               "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(self), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()",
-          },
-        ],
-      },
-      {
-        // Cache static assets (images, icons, fonts, etc.) to prevent refetching and re-renders
-        source: "/_next/static/:path*",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: isDev
-              ? "no-cache, must-revalidate" // Dev: always check if fresh
-              : "public, max-age=2592000, immutable", // Prod: cache for 30 days
           },
         ],
       },
@@ -150,6 +140,11 @@ const nextConfig = {
       {
         source: "/ee/assistants/:path*",
         destination: "/ee/agents/:path*",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/search",
+        destination: "/admin/configuration/index-settings",
         permanent: true,
       },
       {

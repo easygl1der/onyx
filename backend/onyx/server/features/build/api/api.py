@@ -15,27 +15,27 @@ from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.auth.users import optional_user
-from onyx.configs.constants import DocumentSource
-from onyx.db.connector_credential_pair import get_connector_credential_pairs_for_user
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import ConnectorCredentialPairStatus
-from onyx.db.enums import IndexingStatus
 from onyx.db.enums import Permission
-from onyx.db.enums import ProcessingMode
 from onyx.db.enums import SharingScope
-from onyx.db.index_attempt import get_latest_index_attempt_for_cc_pair_id
 from onyx.db.models import BuildSession
 from onyx.db.models import User
+from onyx.server.features.build.api.external_apps_api import (
+    router as external_apps_router,
+)
+from onyx.server.features.build.api.external_apps_oauth_api import (
+    router as external_apps_oauth_router,
+)
 from onyx.server.features.build.api.messages_api import router as messages_router
-from onyx.server.features.build.api.models import BuildConnectorInfo
-from onyx.server.features.build.api.models import BuildConnectorListResponse
-from onyx.server.features.build.api.models import BuildConnectorStatus
 from onyx.server.features.build.api.models import RateLimitResponse
 from onyx.server.features.build.api.rate_limit import get_user_rate_limit_status
 from onyx.server.features.build.api.sessions_api import router as sessions_router
 from onyx.server.features.build.api.user_library import router as user_library_router
 from onyx.server.features.build.db.sandbox import get_sandbox_by_user_id
-from onyx.server.features.build.sandbox import get_sandbox_manager
+from onyx.server.features.build.sandbox.base import get_sandbox_manager
+from onyx.server.features.build.scheduled_tasks.api import (
+    router as scheduled_tasks_router,
+)
 from onyx.server.features.build.session.manager import SessionManager
 from onyx.server.features.build.utils import is_onyx_craft_enabled
 from onyx.utils.logger import setup_logger
@@ -67,6 +67,9 @@ router = APIRouter(prefix="/build", dependencies=[Depends(require_onyx_craft_ena
 router.include_router(sessions_router, tags=["build"])
 router.include_router(messages_router, tags=["build"])
 router.include_router(user_library_router, tags=["build"])
+router.include_router(scheduled_tasks_router, tags=["build"])
+router.include_router(external_apps_router, tags=["build"])
+router.include_router(external_apps_oauth_router, tags=["build"])
 
 
 # -----------------------------------------------------------------------------
@@ -83,152 +86,7 @@ def get_rate_limit(
     return get_user_rate_limit_status(user, db_session)
 
 
-# -----------------------------------------------------------------------------
-# Build Connectors
-# -----------------------------------------------------------------------------
-
-
-@router.get("/connectors", response_model=BuildConnectorListResponse)
-def get_build_connectors(
-    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
-    db_session: Session = Depends(get_session),
-) -> BuildConnectorListResponse:
-    """Get all connectors for the build admin panel.
-
-    Returns connector-credential pairs with simplified status information.
-    On the build configure page, all users (including admins) only see connectors
-    they own/created. Users can create new connectors if they don't have one of a type.
-    """
-    # Fetch both FILE_SYSTEM (standard connectors) and RAW_BINARY (User Library) connectors
-    file_system_cc_pairs = get_connector_credential_pairs_for_user(
-        db_session=db_session,
-        user=user,
-        get_editable=False,
-        eager_load_connector=True,
-        eager_load_credential=True,
-        processing_mode=ProcessingMode.FILE_SYSTEM,
-    )
-    raw_binary_cc_pairs = get_connector_credential_pairs_for_user(
-        db_session=db_session,
-        user=user,
-        get_editable=False,
-        eager_load_connector=True,
-        eager_load_credential=True,
-        processing_mode=ProcessingMode.RAW_BINARY,
-    )
-    cc_pairs = file_system_cc_pairs + raw_binary_cc_pairs
-
-    # Filter to only show connectors created by the current user
-    # All users (including admins) must create their own connectors on the build configure page
-    if user:
-        cc_pairs = [cc_pair for cc_pair in cc_pairs if cc_pair.creator_id == user.id]
-
-    connectors: list[BuildConnectorInfo] = []
-    for cc_pair in cc_pairs:
-        # Skip ingestion API connectors and default pairs
-        if cc_pair.connector.source == DocumentSource.INGESTION_API:
-            continue
-        if cc_pair.name == "DefaultCCPair":
-            continue
-
-        # Determine status
-        error_message: str | None = None
-        has_ever_succeeded = cc_pair.last_successful_index_time is not None
-
-        if cc_pair.status == ConnectorCredentialPairStatus.DELETING:
-            status = BuildConnectorStatus.DELETING
-        elif cc_pair.status == ConnectorCredentialPairStatus.INVALID:
-            # If connector has succeeded before but credentials are now invalid,
-            # show as connected_with_errors so user can still disable demo data
-            if has_ever_succeeded:
-                status = BuildConnectorStatus.CONNECTED_WITH_ERRORS
-                error_message = "Connector credentials are invalid"
-            else:
-                status = BuildConnectorStatus.ERROR
-                error_message = "Connector credentials are invalid"
-        else:
-            # Check latest index attempt for errors
-            latest_attempt = get_latest_index_attempt_for_cc_pair_id(
-                db_session=db_session,
-                connector_credential_pair_id=cc_pair.id,
-                secondary_index=False,
-                only_finished=True,
-            )
-
-            if latest_attempt and latest_attempt.status == IndexingStatus.FAILED:
-                # If connector has succeeded before but latest attempt failed,
-                # show as connected_with_errors
-                if has_ever_succeeded:
-                    status = BuildConnectorStatus.CONNECTED_WITH_ERRORS
-                else:
-                    status = BuildConnectorStatus.ERROR
-                error_message = latest_attempt.error_msg
-            elif (
-                latest_attempt
-                and latest_attempt.status == IndexingStatus.COMPLETED_WITH_ERRORS
-            ):
-                # Completed with errors - if it has succeeded before, show as connected_with_errors
-                if has_ever_succeeded:
-                    status = BuildConnectorStatus.CONNECTED_WITH_ERRORS
-                else:
-                    status = BuildConnectorStatus.ERROR
-                error_message = "Indexing completed with errors"
-            elif cc_pair.status == ConnectorCredentialPairStatus.PAUSED:
-                status = BuildConnectorStatus.CONNECTED
-            elif cc_pair.last_successful_index_time is None:
-                # Never successfully indexed - check if currently indexing
-                # First check cc_pair status for scheduled/initial indexing
-                if cc_pair.status in (
-                    ConnectorCredentialPairStatus.SCHEDULED,
-                    ConnectorCredentialPairStatus.INITIAL_INDEXING,
-                ):
-                    status = BuildConnectorStatus.INDEXING
-                else:
-                    in_progress_attempt = get_latest_index_attempt_for_cc_pair_id(
-                        db_session=db_session,
-                        connector_credential_pair_id=cc_pair.id,
-                        secondary_index=False,
-                        only_finished=False,
-                    )
-                    if (
-                        in_progress_attempt
-                        and in_progress_attempt.status == IndexingStatus.IN_PROGRESS
-                    ):
-                        status = BuildConnectorStatus.INDEXING
-                    elif (
-                        in_progress_attempt
-                        and in_progress_attempt.status == IndexingStatus.NOT_STARTED
-                    ):
-                        status = BuildConnectorStatus.INDEXING
-                    else:
-                        # Has a finished attempt but never succeeded - likely error
-                        status = BuildConnectorStatus.ERROR
-                        error_message = (
-                            latest_attempt.error_msg
-                            if latest_attempt
-                            else "Initial indexing failed"
-                        )
-            else:
-                status = BuildConnectorStatus.CONNECTED
-
-        connectors.append(
-            BuildConnectorInfo(
-                cc_pair_id=cc_pair.id,
-                connector_id=cc_pair.connector.id,
-                credential_id=cc_pair.credential.id,
-                source=cc_pair.connector.source.value,
-                name=cc_pair.name or cc_pair.connector.name or "Unnamed",
-                status=status,
-                docs_indexed=0,  # Would need to query for this
-                last_indexed=cc_pair.last_successful_index_time,
-                error_message=error_message,
-            )
-        )
-
-    return BuildConnectorListResponse(connectors=connectors)
-
-
-# Headers to skip when proxying.
+# Response headers to skip when proxying back from the sandbox.
 # Hop-by-hop headers must not be forwarded, and set-cookie is stripped to
 # prevent LLM-generated apps from setting cookies on the parent Onyx domain.
 EXCLUDED_HEADERS = {
@@ -238,6 +96,62 @@ EXCLUDED_HEADERS = {
     "connection",
     "set-cookie",
 }
+
+# Request headers stripped before forwarding to the sandbox. The sandbox runs
+# LLM-generated webapp code and must never receive the viewer's Onyx
+# credentials, CSRF tokens, or client-identity headers — otherwise a malicious
+# webapp can exfiltrate them (GHSA-v2mx-c9m8-5jrv / GHSA-j6q4-7ghr-53cv).
+#
+# The sandbox webapp is a frontend-only Next.js shell with no callbacks into
+# Onyx, so it does not depend on any of these for correct behavior. The proxy
+# is GET-only; if WebSocket upgrade is ever added, also strip
+# `sec-websocket-protocol`/`sec-websocket-extensions` (can carry bearer tokens).
+#
+# Entries must be lowercase — the filter compares against `key.lower()`.
+# Any header starting with `x-onyx-` is also stripped (see _is_header_excluded)
+# so future Onyx-internal headers don't silently leak.
+EXCLUDED_REQUEST_HEADERS = {
+    # End-to-end but unsafe to forward verbatim.
+    "host",
+    "content-length",
+    # Hop-by-hop (RFC 7230 §6.1).
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    # Credentials.
+    "cookie",
+    "authorization",
+    "x-api-key",
+    "x-auth-token",
+    # CSRF.
+    "x-csrf-token",
+    "x-xsrf-token",
+    # Client identity (RFC 7239 + common ingress/IDP conventions).
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+    "x-real-ip",
+    "x-client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    # IDP-injected identity (oauth2-proxy / similar).
+    "x-forwarded-user",
+    "x-forwarded-email",
+    "x-forwarded-preferred-username",
+}
+
+
+def _is_header_excluded(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in EXCLUDED_REQUEST_HEADERS or lowered.startswith("x-onyx-")
 
 
 def _stream_response(response: httpx.Response) -> Iterator[bytes]:
@@ -391,19 +305,18 @@ def _proxy_request(
     if request.query_params:
         target_url = f"{target_url}?{request.query_params}"
 
-    logger.debug(f"Proxying request to: {target_url}")
+    logger.debug("Proxying request to: %s", target_url)
+
+    forwarded_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if not _is_header_excluded(key)
+    }
 
     try:
         # Make the request to the target URL
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            response = client.get(
-                target_url,
-                headers={
-                    key: value
-                    for key, value in request.headers.items()
-                    if key.lower() not in ("host", "content-length")
-                },
-            )
+            response = client.get(target_url, headers=forwarded_headers)
 
             # Build response headers, excluding hop-by-hop headers
             response_headers = {
@@ -437,10 +350,10 @@ def _proxy_request(
             )
 
     except httpx.TimeoutException:
-        logger.error(f"Timeout while proxying request to {target_url}")
+        logger.error("Timeout while proxying request to %s", target_url)
         raise HTTPException(status_code=504, detail="Gateway timeout")
     except httpx.RequestError as e:
-        logger.error(f"Error proxying request to {target_url}: {e}")
+        logger.error("Error proxying request to %s: %s", target_url, e)
         raise HTTPException(status_code=502, detail="Bad gateway")
 
 
@@ -449,15 +362,12 @@ def _check_webapp_access(
 ) -> BuildSession:
     """Check if user can access a session's webapp.
 
-    - public_global: accessible by anyone (no auth required)
-    - public_org: accessible by any authenticated user
     - private: only accessible by the session owner
+    - public_org: accessible by any authenticated user
     """
     session = db_session.get(BuildSession, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    if session.sharing_scope == SharingScope.PUBLIC_GLOBAL:
-        return session
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     if session.sharing_scope == SharingScope.PRIVATE and session.user_id != user.id:
@@ -479,8 +389,11 @@ def _offline_html_response() -> Response:
     return Response(content=html, status_code=503, media_type="text/html")
 
 
-# Public router for webapp proxy — no authentication required
-# (access controlled per-session via sharing_scope)
+# Router for the webapp proxy. The route is exempted from the global auth
+# middleware (see PUBLIC_ENDPOINT_SPECS in auth_check.py) so the handler can
+# return a friendly redirect to /auth/login for unauthenticated browsers
+# instead of a bare 401. Auth is enforced inside the handler via
+# _check_webapp_access; never wire a handler here that doesn't enforce it.
 public_build_router = APIRouter(prefix="/build")
 
 
@@ -497,7 +410,8 @@ def get_webapp(
 ) -> StreamingResponse | Response:
     """Proxy the webapp for a specific session (root and subpaths).
 
-    Accessible without authentication when sharing_scope is public_global.
+    Requires authentication; access is further gated by the session's
+    sharing_scope (private = owner only, public_org = any org member).
     Returns a friendly offline page when the sandbox is not running.
     """
     try:
@@ -546,7 +460,7 @@ def reset_sandbox(
         raise
     except Exception as e:
         db_session.rollback()
-        logger.error(f"Failed to reset sandbox for user {user.id}: {e}")
+        logger.error("Failed to reset sandbox for user %s: %s", user.id, e)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to reset sandbox: {e}",

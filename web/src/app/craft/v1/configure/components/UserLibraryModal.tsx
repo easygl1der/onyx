@@ -15,7 +15,7 @@ import { LibraryEntry } from "@/app/craft/types/user-library";
 import Text from "@/refresh-components/texts/Text";
 import { Button } from "@opal/components";
 import Modal from "@/refresh-components/Modal";
-import ShadowDiv from "@/refresh-components/ShadowDiv";
+import { ShadowDiv } from "@opal/components";
 import { Section } from "@/layouts/general-layouts";
 import {
   SvgFolder,
@@ -29,7 +29,7 @@ import {
 import Switch from "@/refresh-components/inputs/Switch";
 import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
 import { Tooltip } from "@opal/components";
-import { ConfirmEntityModal } from "@/components/modals/ConfirmEntityModal";
+import { ConfirmEntityModal } from "@/sections/modals/ConfirmEntityModal";
 import IconButton from "@/refresh-components/buttons/IconButton";
 
 /**

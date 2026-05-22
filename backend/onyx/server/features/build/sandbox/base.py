@@ -8,33 +8,65 @@ All database operations should be handled by the caller (SessionManager, Celery 
 
 Architecture Note (User-Shared Sandbox Model):
 - One sandbox (container/pod) is shared across all of a user's sessions
-- provision() creates the user's sandbox with shared files/ directory
+- provision() creates the user's sandbox
 - setup_session_workspace() creates per-session workspace within the sandbox
 - cleanup_session_workspace() removes session workspace on session delete
 - terminate() destroys the entire sandbox (all sessions)
 """
 
 import threading
+import time
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from onyx.server.features.build.configs import SANDBOX_BACKEND
 from onyx.server.features.build.configs import SandboxBackend
+from onyx.server.features.build.sandbox.models import FatalWriteError
+from onyx.server.features.build.sandbox.models import FileSet
 from onyx.server.features.build.sandbox.models import FilesystemEntry
 from onyx.server.features.build.sandbox.models import LLMProviderConfig
+from onyx.server.features.build.sandbox.models import PushFailure
+from onyx.server.features.build.sandbox.models import PushResult
+from onyx.server.features.build.sandbox.models import RetriableWriteError
 from onyx.server.features.build.sandbox.models import SandboxInfo
 from onyx.server.features.build.sandbox.models import SnapshotResult
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
+
+# In-sandbox paths shared by every backend implementation. Kept in sync with
+# the SESSIONS_ROOT constants the individual managers define (those exist
+# separately because the K8s manager emits exec scripts and the Docker
+# manager mounts via the named volume — both happen to land at the same
+# in-container path). The daemon's sandbox_daemon/snapshot.py also has its
+# own copy because it can't import from this package at runtime.
+BUN_CACHE_DIR = "/workspace/sessions/.bun-cache"
+BUN_IMAGE_CACHE_DIR = "/home/sandbox/.bun/install/cache"
+
 # ACPEvent is a union type defined in both local and kubernetes modules
 # Using Any here to avoid circular imports - the actual type checking
 # happens in the implementation modules
 ACPEvent = Any
+
+
+@dataclass
+class SSEKeepalive:
+    """Marker event yielded by sandbox-manager ACP clients when no real ACP
+    events have arrived for ``SSE_KEEPALIVE_INTERVAL`` seconds.
+
+    Defined here (rather than in any one backend's exec client) so every
+    backend yields the same class and ``isinstance`` checks in the
+    session-manager SSE pipeline work uniformly. Otherwise a Docker-emitted
+    keepalive would be a different class than a K8s-emitted keepalive and
+    one would fall through the manager's isinstance chain as "unrecognized"
+    and be silently dropped.
+    """
 
 
 class SandboxManager(ABC):
@@ -50,13 +82,13 @@ class SandboxManager(ABC):
 
     Directory Structure:
         $SANDBOX_ROOT/
-        ├── files/                     # SHARED - symlink to user's persistent documents
+        ├── managed/skills/            # Pushed skills, symlinked per session
         └── sessions/
             ├── $session_id_1/         # Per-session workspace
             │   ├── outputs/           # Agent output for this session
             │   │   └── web/           # Next.js app
             │   ├── venv/              # Python virtual environment
-            │   ├── skills/            # Opencode skills
+            │   ├── .opencode/skills   # Symlink → managed/skills
             │   ├── AGENTS.md          # Agent instructions
             │   ├── opencode.json      # LLM config
             │   └── attachments/
@@ -76,6 +108,7 @@ class SandboxManager(ABC):
         user_id: UUID,
         tenant_id: str,
         llm_config: LLMProviderConfig,
+        onyx_pat: str | None = None,
     ) -> SandboxInfo:
         """Provision a new sandbox for a user.
 
@@ -90,6 +123,7 @@ class SandboxManager(ABC):
             user_id: User identifier who owns this sandbox
             tenant_id: Tenant identifier for multi-tenant isolation
             llm_config: LLM provider configuration (for default config)
+            onyx_pat: Raw PAT token to inject as ONYX_PAT env var in the sandbox
 
         Returns:
             SandboxInfo with the provisioned sandbox details
@@ -117,42 +151,31 @@ class SandboxManager(ABC):
         sandbox_id: UUID,
         session_id: UUID,
         llm_config: LLMProviderConfig,
-        nextjs_port: int,
-        file_system_path: str | None = None,
+        nextjs_port: int | None,
+        skills_section: str,
         snapshot_path: str | None = None,
         user_name: str | None = None,
         user_role: str | None = None,
-        user_work_area: str | None = None,
-        user_level: str | None = None,
-        use_demo_data: bool = False,
-        excluded_user_library_paths: list[str] | None = None,
     ) -> None:
         """Set up a session workspace within an existing sandbox.
 
         Creates the per-session directory structure:
         - sessions/$session_id/outputs/ (from snapshot or template)
         - sessions/$session_id/venv/
-        - sessions/$session_id/skills/
-        - sessions/$session_id/files/ (symlink to demo data or user files)
+        - sessions/$session_id/.opencode/skills (symlink → managed skills dir)
         - sessions/$session_id/AGENTS.md
         - sessions/$session_id/opencode.json
         - sessions/$session_id/attachments/
-        - sessions/$session_id/org_info/ (if demo data enabled)
 
         Args:
             sandbox_id: The sandbox ID (must be provisioned)
             session_id: The session ID for this workspace
             llm_config: LLM provider configuration for opencode.json
-            file_system_path: Path to user's knowledge/source files
+            nextjs_port: Port for the Next.js dev server, or None for headless.
+            skills_section: Pre-rendered ``{{AVAILABLE_SKILLS_SECTION}}`` for AGENTS.md.
             snapshot_path: Optional storage path to restore outputs from
             user_name: User's name for personalization in AGENTS.md
             user_role: User's role/title for personalization in AGENTS.md
-            user_work_area: User's work area for demo persona (e.g., "engineering")
-            user_level: User's level for demo persona (e.g., "ic", "manager")
-            use_demo_data: If True, symlink files/ to demo data; else to user files
-            excluded_user_library_paths: List of paths within user_library to exclude
-                from the sandbox (e.g., ["/data/file.xlsx"]). Only applies when
-                use_demo_data=False. Files at these paths won't be accessible.
 
         Raises:
             RuntimeError: If workspace setup fails
@@ -218,9 +241,9 @@ class SandboxManager(ABC):
         session_id: UUID,
         snapshot_storage_path: str,
         tenant_id: str,
-        nextjs_port: int,
+        nextjs_port: int | None,
         llm_config: LLMProviderConfig,
-        use_demo_data: bool = False,
+        skills_section: str,
     ) -> None:
         """Restore a session workspace from a snapshot.
 
@@ -232,9 +255,9 @@ class SandboxManager(ABC):
             session_id: The session ID to restore
             snapshot_storage_path: Path to the snapshot in storage
             tenant_id: Tenant identifier for storage access
-            nextjs_port: Port number for the NextJS dev server
+            nextjs_port: Port number for the NextJS dev server, or None to
+                skip starting it (e.g. headless scheduled-task fires).
             llm_config: LLM provider configuration for opencode.json
-            use_demo_data: If True, symlink files/ to demo data
 
         Raises:
             RuntimeError: If snapshot restoration fails
@@ -258,6 +281,24 @@ class SandboxManager(ABC):
 
         Returns:
             True if the session workspace exists, False otherwise
+        """
+        ...
+
+    @abstractmethod
+    def list_session_workspaces(self, sandbox_id: UUID) -> list[UUID]:
+        """List session workspace IDs under a sandbox's sessions/ directory.
+
+        Used by idle cleanup to discover which sessions need snapshotting before
+        the sandbox is terminated. Implementations should filter out non-UUID
+        directory names.
+
+        Args:
+            sandbox_id: The sandbox ID
+
+        Returns:
+            List of session UUIDs found under sessions/. Returns an empty list
+            if the sandbox is not running, has no sessions, or the backend does
+            not support cleanup (e.g. local).
         """
         ...
 
@@ -381,6 +422,31 @@ class SandboxManager(ABC):
         ...
 
     @abstractmethod
+    def write_sandbox_file(
+        self,
+        sandbox_id: UUID,
+        path: str,
+        content: str,
+    ) -> None:
+        """Write a text file to the sandbox workspace root.
+
+        Creates parent directories as needed. Sessions symlink to the
+        sandbox-root skills directory, so writes here are visible to
+        all sessions.
+
+        Args:
+            sandbox_id: The sandbox ID
+            path: Relative path (e.g., "skills/company-search/SKILL.md").
+                Must not contain ".." or start with "/".
+            content: UTF-8 text content to write
+
+        Raises:
+            RuntimeError: If write fails
+            ValueError: If path is invalid
+        """
+        ...
+
+    @abstractmethod
     def get_upload_stats(
         self,
         sandbox_id: UUID,
@@ -396,6 +462,127 @@ class SandboxManager(ABC):
             Tuple of (file_count, total_size_bytes)
         """
         ...
+
+    @abstractmethod
+    def write_files_to_sandbox(
+        self,
+        *,
+        sandbox_id: UUID,
+        mount_path: str,
+        files: FileSet,
+    ) -> None:
+        """Write files atomically to a sandbox. Raise RetriableWriteError for
+        transients, FatalWriteError for permanent failures."""
+        ...
+
+    def push_to_sandbox(
+        self,
+        *,
+        sandbox_id: UUID,
+        mount_path: str,
+        files: FileSet,
+        timeout_s: float = 30.0,
+    ) -> PushResult:
+        """Push files to a single sandbox with retry."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.write_files_to_sandbox(
+                    sandbox_id=sandbox_id,
+                    mount_path=mount_path,
+                    files=files,
+                )
+                return PushResult(targets=1, succeeded=1, failures=[])
+            except FatalWriteError as e:
+                return PushResult(
+                    targets=1,
+                    succeeded=0,
+                    failures=[
+                        PushFailure(
+                            sandbox_id=sandbox_id,
+                            reason="write_error",
+                            detail=str(e),
+                        )
+                    ],
+                )
+            except RetriableWriteError:
+                if attempt < max_retries - 1:
+                    time.sleep(min(2**attempt, timeout_s / max_retries))
+                    continue
+                return PushResult(
+                    targets=1,
+                    succeeded=0,
+                    failures=[
+                        PushFailure(
+                            sandbox_id=sandbox_id,
+                            reason="timeout",
+                            detail=f"Failed after {max_retries} retries",
+                        )
+                    ],
+                )
+            except Exception as e:
+                logger.warning(
+                    "Unexpected error pushing to sandbox %s: %s",
+                    sandbox_id,
+                    e,
+                )
+                return PushResult(
+                    targets=1,
+                    succeeded=0,
+                    failures=[
+                        PushFailure(
+                            sandbox_id=sandbox_id,
+                            reason="write_error",
+                            detail=str(e),
+                        )
+                    ],
+                )
+        raise AssertionError("unreachable: all retries should return")
+
+    def push_to_sandboxes(
+        self,
+        *,
+        mount_path: str,
+        sandbox_files: dict[UUID, FileSet],
+        timeout_s: float = 30.0,
+    ) -> PushResult:
+        """Push files to multiple sandboxes in parallel.
+
+        Caller owns user→sandbox resolution (via DB). This method only handles
+        parallelism and result aggregation over push_to_sandbox.
+        """
+        if not sandbox_files:
+            return PushResult(targets=0, succeeded=0, failures=[])
+
+        all_failures: list[PushFailure] = []
+        pushed = 0
+
+        def _push_one(sandbox_id: UUID) -> PushResult:
+            return self.push_to_sandbox(
+                sandbox_id=sandbox_id,
+                mount_path=mount_path,
+                files=sandbox_files[sandbox_id],
+                timeout_s=timeout_s,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(len(sandbox_files), 10)) as pool:
+            for result in pool.map(_push_one, sandbox_files):
+                pushed += result.succeeded
+                all_failures.extend(result.failures)
+
+        if all_failures:
+            logger.warning(
+                "push_to_sandboxes: %d/%d targets failed for mount_path=%s",
+                len(all_failures),
+                len(sandbox_files),
+                mount_path,
+            )
+
+        return PushResult(
+            targets=len(sandbox_files),
+            succeeded=pushed,
+            failures=all_failures,
+        )
 
     @abstractmethod
     def get_webapp_url(self, sandbox_id: UUID, port: int) -> str:
@@ -441,36 +628,6 @@ class SandboxManager(ABC):
 
         Raises:
             ValueError: If file not found or conversion fails
-        """
-        ...
-
-    @abstractmethod
-    def sync_files(
-        self,
-        sandbox_id: UUID,
-        user_id: UUID,
-        tenant_id: str,
-        source: str | None = None,
-    ) -> bool:
-        """Sync files from S3 to the sandbox's /workspace/files directory.
-
-        For Kubernetes backend: Executes `s5cmd sync` in the file-sync sidecar container.
-        For Local backend: No-op since files are directly accessible via symlink.
-
-        This is idempotent - only downloads changed files. File visibility in
-        sessions is controlled via filtered symlinks in setup_session_workspace(),
-        not at the sync level.
-
-        Args:
-            sandbox_id: The sandbox UUID
-            user_id: The user ID (for S3 path construction)
-            tenant_id: The tenant ID (for S3 path construction)
-            source: Optional source type (e.g., "gmail", "google_drive").
-                    If None, syncs all sources. If specified, only syncs
-                    that source's directory.
-
-        Returns:
-            True if sync was successful, False otherwise.
         """
         ...
 
@@ -523,6 +680,13 @@ def get_sandbox_manager() -> SandboxManager:
 
                     _sandbox_manager_instance = KubernetesSandboxManager()
                     logger.info("Using KubernetesSandboxManager for sandbox operations")
+                elif SANDBOX_BACKEND == SandboxBackend.DOCKER:
+                    from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
+                        DockerSandboxManager,
+                    )
+
+                    _sandbox_manager_instance = DockerSandboxManager()
+                    logger.info("Using DockerSandboxManager for sandbox operations")
                 else:
                     raise ValueError(f"Unknown sandbox backend: {SANDBOX_BACKEND}")
 

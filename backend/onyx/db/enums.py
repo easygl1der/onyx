@@ -93,8 +93,8 @@ class IndexingMode(str, PyEnum):
 class ProcessingMode(str, PyEnum):
     """Determines how documents are processed after fetching."""
 
-    REGULAR = "REGULAR"  # Full pipeline: chunk → embed → Vespa
-    FILE_SYSTEM = "FILE_SYSTEM"  # Write to file system only (JSON documents)
+    REGULAR = "REGULAR"  # Full pipeline: chunk → embed → index
+    FILE_SYSTEM = "FILE_SYSTEM"  # Deprecated: bypasses indexing, not searchable
     RAW_BINARY = "RAW_BINARY"  # Write raw binary to S3 (no text extraction)
 
 
@@ -268,10 +268,74 @@ class BuildSessionStatus(str, PyEnum):
     IDLE = "idle"
 
 
+class SessionOrigin(str, PyEnum):
+    """How a BuildSession was created.
+
+    INTERACTIVE: session started by a user in the Craft UI.
+    SCHEDULED:   session started by the scheduled-tasks executor (or any
+                 future non-interactive caller). Sessions with this origin
+                 are excluded from the Craft sidebar list.
+    """
+
+    INTERACTIVE = "INTERACTIVE"
+    SCHEDULED = "SCHEDULED"
+
+
 class SharingScope(str, PyEnum):
     PRIVATE = "private"
     PUBLIC_ORG = "public_org"
-    PUBLIC_GLOBAL = "public_global"
+
+
+class ScheduledTaskStatus(str, PyEnum):
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+
+
+class ScheduledTaskRunStatus(str, PyEnum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+
+    def is_terminal(self) -> bool:
+        """Terminal statuses produce no further state transitions in V1."""
+        return self in (
+            ScheduledTaskRunStatus.SUCCEEDED,
+            ScheduledTaskRunStatus.FAILED,
+            ScheduledTaskRunStatus.SKIPPED,
+        )
+
+
+class ScheduledTaskTriggerSource(str, PyEnum):
+    SCHEDULED = "SCHEDULED"
+    MANUAL_RUN_NOW = "MANUAL_RUN_NOW"
+
+
+class ScheduledTaskErrorClass(str, PyEnum):
+    """Closed set of values for ``ScheduledTaskRun.error_class``.
+
+    Every code path that writes ``error_class`` must use a member of
+    this enum — the column is intentionally a closed set so dashboards
+    and triage queries can pivot on a known vocabulary. For unexpected
+    runtime failures inside the agent drive, use ``AGENT_EXCEPTION``
+    and put the actual exception class name + message in
+    ``error_detail``.
+    """
+
+    TASK_MISSING = "task_missing"
+    SANDBOX_WAKE_FAILED = "sandbox_wake_failed"
+    EXECUTOR_ERROR = "executor_error"
+    TIMEOUT = "timeout"
+    STUCK = "stuck"
+    AGENT_EXCEPTION = "agent_exception"
+
+
+class ScheduledTaskSkipReason(str, PyEnum):
+    """Well-known values for ``ScheduledTaskRun.skip_reason``."""
+
+    PRIOR_IN_FLIGHT = "prior_in_flight"
 
 
 class SandboxStatus(str, PyEnum):
@@ -292,6 +356,27 @@ class SandboxStatus(str, PyEnum):
     def is_sleeping(self) -> bool:
         """Check if sandbox is sleeping (pod terminated but can be restored)."""
         return self == SandboxStatus.SLEEPING
+
+
+class ExternalAppType(str, PyEnum):
+    """Discriminator for the External Apps OAuth dispatch layer.
+
+    Each built-in value names a provider with its own configured
+    authorize URL, token URL, scope, and response parser in
+    `external_apps.providers`. `CUSTOM` is for admin-defined apps
+    that don't go through any built-in OAuth flow (static-token
+    integrations, internal services, etc.).
+    """
+
+    GOOGLE_CALENDAR = "GOOGLE_CALENDAR"
+    SLACK = "SLACK"
+    LINEAR = "LINEAR"
+    CUSTOM = "CUSTOM"
+
+
+class PatType(str, PyEnum):
+    USER = "USER"
+    CRAFT = "CRAFT"
 
 
 class ArtifactType(str, PyEnum):
@@ -339,10 +424,12 @@ class LLMModelFlowType(str, PyEnum):
     CHAT = "chat"
     VISION = "vision"
     CONTEXTUAL_RAG = "contextual_rag"
+    REASONING = "reasoning"
 
 
 class HookPoint(str, PyEnum):
     DOCUMENT_INGESTION = "document_ingestion"
+    DOCUMENT_PUSH = "document_push"
     QUERY_PROCESSING = "query_processing"
 
 
