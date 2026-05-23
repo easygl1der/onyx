@@ -46,6 +46,7 @@ import tarfile
 import threading
 import time
 from collections.abc import Generator
+from collections.abc import Iterator
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
@@ -68,6 +69,10 @@ from onyx.server.features.build.configs import SANDBOX_CONTAINER_IMAGE
 from onyx.server.features.build.configs import SANDBOX_NAMESPACE
 from onyx.server.features.build.configs import SANDBOX_NEXTJS_PORT_END
 from onyx.server.features.build.configs import SANDBOX_NEXTJS_PORT_START
+from onyx.server.features.build.configs import SANDBOX_POD_CPU_LIMIT
+from onyx.server.features.build.configs import SANDBOX_POD_CPU_REQUEST
+from onyx.server.features.build.configs import SANDBOX_POD_MEMORY_LIMIT
+from onyx.server.features.build.configs import SANDBOX_POD_MEMORY_REQUEST
 from onyx.server.features.build.configs import SANDBOX_S3_BUCKET
 from onyx.server.features.build.configs import SANDBOX_SERVICE_ACCOUNT_NAME
 from onyx.server.features.build.sandbox.acp.base import ACPEvent
@@ -115,8 +120,17 @@ _API_SERVER_HOSTNAME = os.environ.get("HOSTNAME", "unknown")
 # SANDBOX_NEXTJS_PORT_END range, with one port per session.
 AGENT_PORT = 8081
 PUSH_DAEMON_PORT = 8731
-POD_READY_TIMEOUT_SECONDS = 120
-POD_READY_POLL_INTERVAL_SECONDS = 2
+POD_READY_TIMEOUT_SECONDS = 60
+# Progressive poll cadence: short intervals up front (pods usually become
+# Ready in 12–18s, so we want to catch the transition quickly), then back
+# off so a stuck pod doesn't hammer the API server. Each tuple is
+# (count, interval_seconds). Sum of count × interval must stay ≤
+# POD_READY_TIMEOUT_SECONDS.
+POD_READY_POLL_SCHEDULE: tuple[tuple[int, float], ...] = (
+    (6, 0.5),  # 0–3s
+    (5, 1.0),  # 3–8s
+    (26, 2.0),  # 8–60s
+)
 
 # Resource deletion timeout and polling interval
 # Kubernetes deletes are async - we need to wait for resources to actually be gone
@@ -387,8 +401,14 @@ class KubernetesSandboxManager(SandboxManager):
                 ),
             ],
             resources=client.V1ResourceRequirements(
-                requests={"cpu": "1000m", "memory": "2Gi"},
-                limits={"cpu": "2000m", "memory": "10Gi"},
+                requests={
+                    "cpu": SANDBOX_POD_CPU_REQUEST,
+                    "memory": SANDBOX_POD_MEMORY_REQUEST,
+                },
+                limits={
+                    "cpu": SANDBOX_POD_CPU_LIMIT,
+                    "memory": SANDBOX_POD_MEMORY_LIMIT,
+                },
             ),
             security_context=client.V1SecurityContext(
                 allow_privilege_escalation=False,
@@ -418,6 +438,21 @@ class KubernetesSandboxManager(SandboxManager):
             value = os.environ.get(var)
             if value:
                 sidecar_env.append(client.V1EnvVar(name=var, value=value))
+
+        # s5cmd v2.3.0 reads S3_ENDPOINT_URL — it does NOT honor
+        # AWS_ENDPOINT_URL. Mirror AWS_ENDPOINT_URL into S3_ENDPOINT_URL
+        # so the snapshot daemon's `s5cmd pipe`/`cat` and the file-sync
+        # sidecar's `s5cmd sync` both hit MinIO in dev/CI.
+        #
+        # We do NOT forward the api_server's own S3_ENDPOINT_URL: in CI
+        # that points at a host-network MinIO (localhost:9004 from
+        # docker-compose) which is unreachable from inside the pod. The
+        # cluster-DNS-reachable endpoint is always in AWS_ENDPOINT_URL.
+        aws_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+        if aws_endpoint:
+            sidecar_env.append(
+                client.V1EnvVar(name="S3_ENDPOINT_URL", value=aws_endpoint)
+            )
         sidecar_container = client.V1Container(
             name="sidecar",
             image=self._image,
@@ -686,6 +721,17 @@ class KubernetesSandboxManager(SandboxManager):
 
         return None
 
+    def _pod_ready_poll_intervals(self) -> Iterator[float]:
+        """Yield poll intervals according to ``POD_READY_POLL_SCHEDULE``.
+
+        Fast-path detection in the first few seconds (pods usually transition
+        Pending→Running→Ready in 12–18s), then back off so a stuck pod
+        doesn't hammer the API server.
+        """
+        for count, interval in POD_READY_POLL_SCHEDULE:
+            for _ in range(count):
+                yield interval
+
     def _wait_for_pod_ready(
         self,
         pod_name: str,
@@ -704,6 +750,7 @@ class KubernetesSandboxManager(SandboxManager):
             RuntimeError: If pod fails or is deleted
         """
         start_time = time.time()
+        poll_intervals = self._pod_ready_poll_intervals()
 
         while time.time() - start_time < timeout:
             try:
@@ -748,7 +795,7 @@ class KubernetesSandboxManager(SandboxManager):
                     raise RuntimeError(f"Pod {pod_name} was deleted")
                 logger.warning("Error checking pod status: %s", e)
 
-            time.sleep(POD_READY_POLL_INTERVAL_SECONDS)
+            time.sleep(next(poll_intervals, 2.0))
 
         # On timeout, check one more time for init container failures
         try:
@@ -1500,10 +1547,10 @@ echo "Session cleanup complete"
         llm_config: LLMProviderConfig,
         skills_section: str,
     ) -> None:
-        """Download snapshot from S3 via AWS CLI, extract, regenerate config, and start NextJS.
+        """Download snapshot from S3 via s5cmd, extract, regenerate config, and start NextJS.
 
         Steps:
-        1. Download snapshot from S3 via aws s3 cp in the sandbox container
+        1. Download snapshot from S3 via s5cmd cat in the sandbox container
         2. Pipe directly to tar for extraction
         3. Regenerate configuration files (AGENTS.md, opencode.json)
         4. Start the NextJS dev server (skipped when ``nextjs_port`` is None,
